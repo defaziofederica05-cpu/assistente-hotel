@@ -17,7 +17,7 @@ DB_FILE = "bookings.db"
 # =====================================================
 def crea_e_popola_database():
     if os.path.exists(DB_FILE):
-        return  # se esiste già non fare nulla
+        return
 
     db = sqlite3.connect(DB_FILE)
     cur = db.cursor()
@@ -99,8 +99,21 @@ def mostra_dati_da_db():
 
 
 # =====================================================
-# 3️⃣ CALCOLI UTILI
+# 3️⃣ FUNZIONI UTILI
 # =====================================================
+
+# Converte date in italiano in formato leggibile da pandas
+def parse_date_italiano(date_str):
+    mesi = {
+        "gennaio": "Jan", "febbraio": "Feb", "marzo": "Mar", "aprile": "Apr",
+        "maggio": "May", "giugno": "Jun", "luglio": "Jul", "agosto": "Aug",
+        "settembre": "Sep", "ottobre": "Oct", "novembre": "Nov", "dicembre": "Dec"
+    }
+    for it, en in mesi.items():
+        date_str = re.sub(it, en, date_str, flags=re.IGNORECASE)
+    return pd.to_datetime(date_str, dayfirst=True).strftime("%Y-%m-%d")
+
+
 def calcola_ricavo(period_start: str, period_end: str) -> float:
     conn = sqlite3.connect(DB_FILE)
 
@@ -109,19 +122,15 @@ def calcola_ricavo(period_start: str, period_end: str) -> float:
         check_out = datetime.strptime(check_out_str, "%Y-%m-%d")
         start_period = datetime.strptime(start_period_str, "%Y-%m-%d")
         end_period = datetime.strptime(end_period_str, "%Y-%m-%d")
-
         ci = max(check_in, start_period)
         co = min(check_out, end_period)
-
         stay_days = (check_out - check_in).days
         overlap_days = (co - ci).days
-
         if overlap_days <= 0 or stay_days <= 0:
             return 0
         return price * (overlap_days / stay_days)
 
     conn.create_function("RICAVO_PER_PERIODO", 5, ricavo_per_periodo)
-
     query = f"""
     SELECT SUM(RICAVO_PER_PERIODO(check_in, check_out, price, '{period_start}', '{period_end}')) as totale
     FROM prenotazioni
@@ -141,8 +150,7 @@ def camere_libere(period_start: str, period_end: str, room_type: str) -> int:
         conn.close()
         return 0
     total_rooms = int(df_total.iloc[0]["total_rooms"])
-
-    query = f"""
+    query = """
     SELECT COUNT(*) as occupate
     FROM prenotazioni
     WHERE room_type=? AND status='Confermata' 
@@ -167,29 +175,6 @@ def notti_ospite(guest_name: str) -> int:
     return totale_notti
 
 
-def ricerca_prenotazioni(guest_name=None, room_type=None, period_start=None, period_end=None):
-    conn = sqlite3.connect(DB_FILE)
-    query = "SELECT * FROM prenotazioni WHERE 1=1"
-    params = []
-
-    if guest_name:
-        query += " AND guest_name LIKE ?"
-        params.append(f"%{guest_name}%")
-    if room_type:
-        query += " AND room_type=?"
-        params.append(room_type)
-    if period_start:
-        query += " AND check_out > ?"
-        params.append(period_start)
-    if period_end:
-        query += " AND check_in < ?"
-        params.append(period_end)
-
-    df = pd.read_sql_query(query, conn, params=params)
-    conn.close()
-    return df
-
-
 # =====================================================
 # 4️⃣ STREAMLIT APP INTERATTIVA
 # =====================================================
@@ -211,10 +196,8 @@ def main():
     st.info("""
     Puoi chiedere:
     - Ricavo totale confermato nel mese o periodo personalizzato
-    - Occupazione camere
     - Camere libere per periodo e tipo
     - Notti prenotate da un ospite
-    - Ricerca prenotazioni filtrata per ospite, tipo camera e periodo
     """)
 
     query = st.text_input("💬 Fai la tua domanda:", key="user_query")
@@ -222,8 +205,7 @@ def main():
     if query:
         with st.spinner("Sto elaborando..."):
             q = query.lower()
-
-            # Ricavo mese
+            # Ricavo mese dicembre 2025
             if "mese" in q and "dicembre" in q and "2025" in q:
                 totale_dicembre = calcola_ricavo("2025-12-01", "2025-12-31")
                 st.success(f"💰 Ricavo totale confermato a dicembre 2025: {totale_dicembre:.2f} €")
@@ -233,16 +215,50 @@ def main():
             m = re.findall(r"(\d{1,2}\s\w+\s\d{4}|\d{4}-\d{2}-\d{2})", query)
             if "ricavo" in q and len(m) >= 2:
                 try:
-                    start = pd.to_datetime(m[0], dayfirst=True).strftime("%Y-%m-%d")
-                    end = pd.to_datetime(m[1], dayfirst=True).strftime("%Y-%m-%d")
+                    start = parse_date_italiano(m[0])
+                    end = parse_date_italiano(m[1])
                     totale_periodo = calcola_ricavo(start, end)
                     st.success(f"💰 Ricavo totale confermato dal {start} al {end}: {totale_periodo:.2f} €")
                     return
                 except Exception:
                     st.info("❌ Non sono riuscito a interpretare le date. Usa AAAA-MM-GG o GG mese AAAA.")
 
-            # Altre funzionalità (camere libere, notti ospite, ricerca prenotazioni)
-            st.info("❓ Domande possibili: ricavo mese, ricavo periodo, camere libere, notti ospite, ricerca prenotazioni.")
+            # Camere libere per tipo e periodo
+            if "camere" in q and ("libere" in q or "disponibili" in q):
+                room_match = re.search(r"(standard|deluxe|executive|junior suite|suite)", q)
+                if room_match:
+                    room_type = room_match.group(1).title()
+                else:
+                    room_type = None
+
+                if len(m) >= 2:
+                    start = parse_date_italiano(m[0])
+                    end = parse_date_italiano(m[1])
+                elif len(m) == 1:
+                    start = end = parse_date_italiano(m[0])
+                else:
+                    st.info("❌ Inserisci almeno una data.")
+                    return
+
+                if room_type:
+                    disponibili = camere_libere(start, end, room_type)
+                    st.success(f"🏨 Camere {room_type} libere dal {start} al {end}: {disponibili}")
+                else:
+                    st.success("❌ Specifica il tipo di camera (Standard, Deluxe, Executive, Junior Suite, Suite).")
+                return
+
+            # Notti prenotate da un ospite
+            if "notti" in q or "ospite" in q:
+                guest_match = re.search(r"di\s([\w\s]+)", q)
+                if guest_match:
+                    guest_name = guest_match.group(1).strip().title()
+                    totale_notti = notti_ospite(guest_name)
+                    st.success(f"🛌 {guest_name} ha prenotato {totale_notti} notti confermate")
+                else:
+                    st.info("❌ Specifica il nome dell'ospite.")
+                return
+
+            st.info("❓ Domande possibili: ricavo mese, ricavo periodo, camere libere, notti ospite.")
 
 
 if __name__ == "__main__":
